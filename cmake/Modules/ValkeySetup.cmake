@@ -193,11 +193,27 @@ if (BUILD_RDMA)
     if (LINUX AND NOT APPLE)
         valkey_parse_build_option(${BUILD_RDMA} USE_RDMA)
         find_package(PkgConfig REQUIRED)
-        # Locate librdmacm & libibverbs, fail if we can't find them
-        valkey_pkg_config(librdmacm RDMACM_LIBS)
-        valkey_pkg_config(libibverbs IBVERBS_LIBS)
-        message(STATUS "${RDMACM_LIBS};${IBVERBS_LIBS}")
-        list(APPEND RDMA_LIBS "${RDMACM_LIBS};${IBVERBS_LIBS}")
+
+        # Check which RDMA transport backend to use.
+        # RDMA_PROVIDER can be "verbs" (default) or "fabric".
+        if (NOT DEFINED RDMA_PROVIDER)
+            set(RDMA_PROVIDER "verbs")
+        endif ()
+
+        if (RDMA_PROVIDER STREQUAL "fabric")
+            # Use libfabric backend
+            valkey_pkg_config(libfabric FABRIC_LIBS)
+            message(STATUS "RDMA transport: libfabric (${FABRIC_LIBS})")
+            list(APPEND RDMA_LIBS "${FABRIC_LIBS}")
+            add_valkey_server_compiler_options("-DUSE_RDMA_FABRIC")
+        else ()
+            # Default: use ibverbs/rdma_cm backend
+            valkey_pkg_config(librdmacm RDMACM_LIBS)
+            valkey_pkg_config(libibverbs IBVERBS_LIBS)
+            message(STATUS "RDMA transport: verbs (${RDMACM_LIBS};${IBVERBS_LIBS})")
+            list(APPEND RDMA_LIBS "${RDMACM_LIBS};${IBVERBS_LIBS}")
+            add_valkey_server_compiler_options("-DUSE_RDMA_VERBS")
+        endif ()
 
         if (USE_RDMA EQUAL 2) # Module
             message(STATUS "Building RDMA as module")
