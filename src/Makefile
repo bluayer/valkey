@@ -356,15 +356,32 @@ ifeq ($(BUILD_TLS),module)
 endif
 
 RDMA_LIBS=
-RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists librdmacm libibverbs && echo $$?)
-ifeq ($(RDMA_PKGCONFIG),0)
-	RDMA_LIBS=$(shell $(PKG_CONFIG) --libs librdmacm libibverbs)
+RDMA_SRC=rdma.c
+RDMA_OBJ=rdma.o
+
+# RDMA_PROVIDER: "verbs" (default) or "fabric"
+ifeq ($(RDMA_PROVIDER),fabric)
+	RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists libfabric && echo $$?)
+	ifeq ($(RDMA_PKGCONFIG),0)
+		RDMA_LIBS=$(shell $(PKG_CONFIG) --libs libfabric)
+	else
+		RDMA_LIBS=-lfabric
+	endif
+	RDMA_SRC=rdma_fabric.c
+	RDMA_OBJ=rdma_fabric.o
+	RDMA_PROVIDER_CFLAGS=-DUSE_RDMA_FABRIC
 else
-	RDMA_LIBS=-lrdmacm -libverbs
+	RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists librdmacm libibverbs && echo $$?)
+	ifeq ($(RDMA_PKGCONFIG),0)
+		RDMA_LIBS=$(shell $(PKG_CONFIG) --libs librdmacm libibverbs)
+	else
+		RDMA_LIBS=-lrdmacm -libverbs
+	endif
+	RDMA_PROVIDER_CFLAGS=-DUSE_RDMA_VERBS
 endif
 
 ifeq ($(BUILD_RDMA),yes)
-	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_YES) -DBUILD_RDMA_MODULE=$(BUILD_NO)
+	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_YES) -DBUILD_RDMA_MODULE=$(BUILD_NO) $(RDMA_PROVIDER_CFLAGS)
 	FINAL_LIBS += ../deps/libvalkey/lib/libvalkey_rdma.a $(RDMA_LIBS)
 endif
 
@@ -372,10 +389,10 @@ RDMA_MODULE=
 RDMA_MODULE_NAME:=valkey-rdma$(PROG_SUFFIX).so
 RDMA_MODULE_CFLAGS:=$(FINAL_CFLAGS)
 ifeq ($(BUILD_RDMA),module)
-	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE)
+	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE) $(RDMA_PROVIDER_CFLAGS)
 	RDMA_CLIENT_LIBS = ../deps/libvalkey/lib/libvalkey_rdma.a
 	RDMA_MODULE=$(RDMA_MODULE_NAME)
-	RDMA_MODULE_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE) -DBUILD_RDMA_MODULE=$(BUILD_MODULE) $(RDMA_LIBS)
+	RDMA_MODULE_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE) -DBUILD_RDMA_MODULE=$(BUILD_MODULE) $(RDMA_PROVIDER_CFLAGS) $(RDMA_LIBS)
 endif
 
 ifndef V
@@ -521,7 +538,7 @@ ENGINE_SERVER_OBJ = \
     rand.o \
     rax.o \
     rdb.o \
-    rdma.o \
+    $(RDMA_OBJ) \
     release.o \
     replication.o \
     resp_parser.o \
@@ -712,7 +729,7 @@ $(TLS_MODULE_NAME): $(SERVER_NAME)
 
 # valkey-rdma.so
 $(RDMA_MODULE_NAME): $(SERVER_NAME)
-	$(QUIET_CC)$(CC) $(LDFLAGS) -o $@ rdma.c -shared -fPIC $(RDMA_MODULE_CFLAGS)
+	$(QUIET_CC)$(CC) $(LDFLAGS) -o $@ $(RDMA_SRC) -shared -fPIC $(RDMA_MODULE_CFLAGS)
 
 # engine_lua.so
 $(LUA_MODULE_NAME): .make-prerequisites

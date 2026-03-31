@@ -94,7 +94,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/tracking.c
     ${CMAKE_SOURCE_DIR}/src/socket.c
     ${CMAKE_SOURCE_DIR}/src/tls.c
-    ${CMAKE_SOURCE_DIR}/src/rdma.c
+    ${VALKEY_RDMA_SRC}
     ${CMAKE_SOURCE_DIR}/src/sha256.c
     ${CMAKE_SOURCE_DIR}/src/timeout.c
     ${CMAKE_SOURCE_DIR}/src/setcpuaffinity.c
@@ -176,8 +176,13 @@ set(VALKEY_BENCHMARK_SRCS
     ${CMAKE_SOURCE_DIR}/src/fuzzer_client.c
     ${CMAKE_SOURCE_DIR}/src/fuzzer_command_generator.c)
 
-# valkey-rdma module
-set(VALKEY_RDMA_MODULE_SRCS ${CMAKE_SOURCE_DIR}/src/rdma.c)
+# valkey-rdma: select source based on RDMA_PROVIDER
+if (RDMA_PROVIDER STREQUAL "fabric")
+    set(VALKEY_RDMA_SRC ${CMAKE_SOURCE_DIR}/src/rdma_fabric.c)
+else ()
+    set(VALKEY_RDMA_SRC ${CMAKE_SOURCE_DIR}/src/rdma.c)
+endif ()
+set(VALKEY_RDMA_MODULE_SRCS ${VALKEY_RDMA_SRC})
 
 # valkey-tls module
 set(VALKEY_TLS_MODULE_SRCS ${CMAKE_SOURCE_DIR}/src/tls.c)
