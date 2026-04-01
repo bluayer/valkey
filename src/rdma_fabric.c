@@ -332,6 +332,14 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
         serverLog(LL_VERBOSE, "RDMA: provider requires FI_MR_ENDPOINT");
     }
 
+    /* Wire protocol only supports 32-bit rkey — reject providers with larger keys */
+    if (fi->domain_attr->mr_key_size > 4) {
+        serverLog(LL_WARNING, "RDMA: provider uses %zu-byte MR keys, "
+                  "but wire protocol only supports 32-bit rkey",
+                  fi->domain_attr->mr_key_size);
+        goto err;
+    }
+
     ret = fi_fabric(fi->fabric_attr, &rdma_g.fabric, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_fabric failed: %s", fi_strerror(-ret));
