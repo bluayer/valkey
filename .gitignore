@@ -58,3 +58,4 @@ cmake-build-debug/
 cmake-build-release/
 __pycache__
 src/unit/.flags
+tests/rdma/test_rdma_fabric
