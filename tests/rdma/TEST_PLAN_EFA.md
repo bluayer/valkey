@@ -249,15 +249,24 @@ aws ec2 delete-security-group --group-id $SG_ID
 
 ## Important Notes
 
-- **EFA `efa` provider vs `verbs` provider**: On EFA instances, libfabric has both
-  an `efa` provider (SRD protocol) and a `verbs` provider (ibverbs compat).
-  Our `rdma_fabric.c` should work with the `verbs` provider for wire-protocol
-  compatibility. Set `FI_PROVIDER=verbs` if needed:
+- **Architecture**: `rdma_fabric.c` uses native **FI_EP_RDM** (reliable datagram),
+  not FI_EP_MSG. This is the only endpoint type EFA supports natively.
+  - **Shared endpoint**: One RDM endpoint for all connections, peers identified by `fi_addr_t`
+  - **TCP handshake**: Replaces RDMA CM. The server listens on a TCP socket; clients
+    connect via TCP, exchange `fi_getname` addresses, then communicate via RDMA.
+  - **Address Vector (AV)**: `fi_av_insert()` registers peers after TCP handshake
+  - **Global CQ**: `fi_cq_readfrom()` returns source address for demuxing
+  - **eventfd per connection**: Bridges shared CQ to Valkey's per-fd ae event loop
+- **EFA provider**: Should work directly with the `efa` provider (SRD protocol).
+  The implementation handles `FI_MR_ENDPOINT` mode which EFA requires.
+  Set `FI_PROVIDER=efa` to force EFA provider (usually auto-detected):
   ```bash
-  export FI_PROVIDER=verbs
+  export FI_PROVIDER=efa
   ```
-- **If `efa` provider is preferred**: The SRD protocol may require adjustments
-  to the MR registration flags since EFA has different MR mode requirements.
-  Test with `verbs` provider first.
-- The client-side (`deps/libvalkey/src/rdma.c`) still uses ibverbs directly —
-  this is out of scope and unchanged.
+- **Wire protocol**: The 32-byte ValkeyRdmaCmd format is unchanged. RDMA writes
+  use `fi_writemsg` with `FI_REMOTE_CQ_DATA` (equivalent to ibverbs
+  `IBV_WR_RDMA_WRITE_WITH_IMM`).
+- **Client-side note**: The client (`deps/libvalkey/src/rdma.c`) still uses ibverbs
+  with FI_EP_MSG/rdma_cm. For EFA testing, both server and client must be on EFA
+  instances. The client's ibverbs RDMA path should work via EFA's ibverbs
+  compatibility layer (libibverbs + rdma_cm over EFA).
