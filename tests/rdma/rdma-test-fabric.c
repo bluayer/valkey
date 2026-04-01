@@ -146,6 +146,30 @@ typedef struct FabricContext {
 static int connRdmaHandleCq(FabricContext *ctx);
 
 /* ========================================================================
+ * TCP helpers: safe partial read/write
+ * ======================================================================== */
+
+static ssize_t tcpReadFull(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = read(fd, (char *)buf + total, len - total);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return (ssize_t)total;
+}
+
+static ssize_t tcpWriteFull(int fd, const void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = write(fd, (const char *)buf + total, len - total);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return (ssize_t)total;
+}
+
+/* ========================================================================
  * TCP handshake: exchange fi_getname addresses with server
  * ======================================================================== */
 
@@ -167,19 +191,19 @@ static fi_addr_t tcpHandshake(FabricContext *ctx, int tcp_fd) {
 
     /* Send our name (client sends first) */
     uint32_t len_net = htonl((uint32_t)local_name_len);
-    n = write(tcp_fd, &len_net, sizeof(len_net));
-    if (n != sizeof(len_net)) return FI_ADDR_UNSPEC;
-    n = write(tcp_fd, local_name, local_name_len);
-    if (n != (ssize_t)local_name_len) return FI_ADDR_UNSPEC;
+    n = tcpWriteFull(tcp_fd, &len_net, sizeof(len_net));
+    if (n < 0) return FI_ADDR_UNSPEC;
+    n = tcpWriteFull(tcp_fd, local_name, local_name_len);
+    if (n < 0) return FI_ADDR_UNSPEC;
 
     /* Read server name */
-    n = read(tcp_fd, &peer_name_len, sizeof(peer_name_len));
-    if (n != sizeof(peer_name_len)) return FI_ADDR_UNSPEC;
+    n = tcpReadFull(tcp_fd, &peer_name_len, sizeof(peer_name_len));
+    if (n < 0) return FI_ADDR_UNSPEC;
     peer_name_len = ntohl(peer_name_len);
     if (peer_name_len > RDMA_MAX_EP_NAME) return FI_ADDR_UNSPEC;
 
-    n = read(tcp_fd, peer_name, peer_name_len);
-    if (n != (ssize_t)peer_name_len) return FI_ADDR_UNSPEC;
+    n = tcpReadFull(tcp_fd, peer_name, peer_name_len);
+    if (n < 0) return FI_ADDR_UNSPEC;
 
     /* Insert into AV */
     ret = fi_av_insert(ctx->av, peer_name, 1, &addr, 0, NULL);

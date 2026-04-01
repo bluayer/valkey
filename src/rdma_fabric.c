@@ -323,7 +323,7 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     fi_freeinfo(hints);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_getinfo failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
     rdma_g.fi = fi;
 
@@ -335,13 +335,13 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     ret = fi_fabric(fi->fabric_attr, &rdma_g.fabric, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_fabric failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     ret = fi_domain(rdma_g.fabric, fi, &rdma_g.domain, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_domain failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     /* CQ with FD wait + FI_CQ_FORMAT_DATA for immediate data */
@@ -354,13 +354,13 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     ret = fi_cq_open(rdma_g.domain, &cq_attr, &rdma_g.cq, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_cq_open failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     ret = fi_control(&rdma_g.cq->fid, FI_GETWAIT, &fd);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: FI_GETWAIT on CQ failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
     rdma_g.cq_fd = fd;
     anetNonBlock(NULL, fd);
@@ -371,32 +371,32 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     ret = fi_av_open(rdma_g.domain, &av_attr, &rdma_g.av, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_av_open failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     /* RDM endpoint */
     ret = fi_endpoint(rdma_g.domain, fi, &rdma_g.ep, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_endpoint failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     ret = fi_ep_bind(rdma_g.ep, &rdma_g.cq->fid, FI_TRANSMIT | FI_RECV);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_ep_bind CQ failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     ret = fi_ep_bind(rdma_g.ep, &rdma_g.av->fid, 0);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_ep_bind AV failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     ret = fi_enable(rdma_g.ep);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_enable failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     /* Get local endpoint name for address exchange */
@@ -404,7 +404,7 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     ret = fi_getname(&rdma_g.ep->fid, rdma_g.local_name, &rdma_g.local_name_len);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_getname failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     /* Allocate global recv buffer pool */
@@ -416,7 +416,7 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
                     &rdma_g.recv_pool_mr, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_mr_reg recv pool failed: %s", fi_strerror(-ret));
-        return C_ERR;
+        goto err;
     }
 
     if (rdma_g.fi->domain_attr->mr_mode & FI_MR_ENDPOINT) {
@@ -440,7 +440,7 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
         ret = fi_recvmsg(rdma_g.ep, &msg, 0);
         if (ret) {
             serverLog(LL_WARNING, "RDMA: initial fi_recvmsg failed: %s", fi_strerror(-ret));
-            return C_ERR;
+            goto err;
         }
     }
     rdma_g.recv_pool_posted = RDMA_RECV_POOL_SIZE;
@@ -448,13 +448,17 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     /* Register CQ fd with ae for global polling */
     if (aeCreateFileEvent(server.el, rdma_g.cq_fd, AE_READABLE, rdmaGlobalCqHandler, NULL) == AE_ERR) {
         serverLog(LL_WARNING, "RDMA: failed to register CQ fd with event loop");
-        return C_ERR;
+        goto err;
     }
 
     memset(rdma_g.conn_map, 0, sizeof(rdma_g.conn_map));
     rdma_g.initialized = 1;
     serverLog(LL_NOTICE, "RDMA: global fabric initialized (provider: %s)", fi->fabric_attr->prov_name);
     return C_OK;
+
+err:
+    rdmaGlobalCleanup();
+    return C_ERR;
 }
 
 static void rdmaGlobalCleanup(void) {
@@ -488,7 +492,7 @@ static int rdmaPostRecv(ValkeyRdmaCmd *cmd) {
         .context = cmd,
     };
     int ret = fi_recvmsg(rdma_g.ep, &msg, 0);
-    if (ret && ret != -FI_EAGAIN) {
+    if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_recvmsg failed: %s", fi_strerror(-ret));
         return C_ERR;
     }
@@ -577,7 +581,7 @@ static int rdmaAdjustSendbuf(RdmaContext *ctx, unsigned int length) {
 
     if (ctx->tx_length) {
         fi_close(&ctx->tx.mr->fid);
-        zlibc_free(ctx->tx.addr);
+        rdmaMemoryFree(ctx->tx.addr, ctx->tx_length);
         ctx->tx_length = 0;
     }
 
@@ -587,7 +591,7 @@ static int rdmaAdjustSendbuf(RdmaContext *ctx, unsigned int length) {
     if (ret) {
         serverRdmaError(server.neterr, "RDMA: reg send mr failed");
         serverLog(LL_WARNING, "RDMA: FATAL error, fi_mr_reg tx failed: %s", fi_strerror(-ret));
-        zlibc_free(ctx->tx.addr);
+        rdmaMemoryFree(ctx->tx.addr, length);
         ctx->tx.addr = NULL;
         ctx->tx_length = 0;
         return C_ERR;
@@ -605,24 +609,42 @@ static int rdmaAdjustSendbuf(RdmaContext *ctx, unsigned int length) {
  * TCP handshake for fi_getname address exchange
  * ======================================================================== */
 
+/* Reliable read/write helpers for TCP handshake (handle partial transfers) */
+static ssize_t tcpReadFull(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = read(fd, (char *)buf + total, len - total);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return total;
+}
+
+static ssize_t tcpWriteFull(int fd, const void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = write(fd, (const char *)buf + total, len - total);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return total;
+}
+
 /* Server side: read peer's EP name from TCP, insert into AV, send ours back.
  * Returns fi_addr_t or FI_ADDR_UNSPEC on error. */
 static fi_addr_t rdmaTcpHandshakeServer(int tcp_fd) {
     uint8_t peer_name[RDMA_MAX_EP_NAME];
     uint32_t peer_name_len;
     fi_addr_t addr = FI_ADDR_UNSPEC;
-    ssize_t n;
     int ret;
 
     /* Read peer name length (4 bytes, network order) */
-    n = read(tcp_fd, &peer_name_len, sizeof(peer_name_len));
-    if (n != sizeof(peer_name_len)) return FI_ADDR_UNSPEC;
+    if (tcpReadFull(tcp_fd, &peer_name_len, sizeof(peer_name_len)) < 0) return FI_ADDR_UNSPEC;
     peer_name_len = ntohl(peer_name_len);
-    if (peer_name_len > RDMA_MAX_EP_NAME) return FI_ADDR_UNSPEC;
+    if (peer_name_len == 0 || peer_name_len > RDMA_MAX_EP_NAME) return FI_ADDR_UNSPEC;
 
     /* Read peer name */
-    n = read(tcp_fd, peer_name, peer_name_len);
-    if (n != (ssize_t)peer_name_len) return FI_ADDR_UNSPEC;
+    if (tcpReadFull(tcp_fd, peer_name, peer_name_len) < 0) return FI_ADDR_UNSPEC;
 
     /* Insert peer into AV */
     ret = fi_av_insert(rdma_g.av, peer_name, 1, &addr, 0, NULL);
@@ -633,10 +655,8 @@ static fi_addr_t rdmaTcpHandshakeServer(int tcp_fd) {
 
     /* Send our local name back */
     uint32_t local_len_net = htonl((uint32_t)rdma_g.local_name_len);
-    n = write(tcp_fd, &local_len_net, sizeof(local_len_net));
-    if (n != sizeof(local_len_net)) goto err_remove;
-    n = write(tcp_fd, rdma_g.local_name, rdma_g.local_name_len);
-    if (n != (ssize_t)rdma_g.local_name_len) goto err_remove;
+    if (tcpWriteFull(tcp_fd, &local_len_net, sizeof(local_len_net)) < 0) goto err_remove;
+    if (tcpWriteFull(tcp_fd, rdma_g.local_name, rdma_g.local_name_len) < 0) goto err_remove;
 
     return addr;
 
@@ -650,25 +670,20 @@ static fi_addr_t rdmaTcpHandshakeClient(int tcp_fd) {
     uint8_t peer_name[RDMA_MAX_EP_NAME];
     uint32_t peer_name_len;
     fi_addr_t addr = FI_ADDR_UNSPEC;
-    ssize_t n;
     int ret;
 
     /* Send our local name */
     uint32_t local_len_net = htonl((uint32_t)rdma_g.local_name_len);
-    n = write(tcp_fd, &local_len_net, sizeof(local_len_net));
-    if (n != sizeof(local_len_net)) return FI_ADDR_UNSPEC;
-    n = write(tcp_fd, rdma_g.local_name, rdma_g.local_name_len);
-    if (n != (ssize_t)rdma_g.local_name_len) return FI_ADDR_UNSPEC;
+    if (tcpWriteFull(tcp_fd, &local_len_net, sizeof(local_len_net)) < 0) return FI_ADDR_UNSPEC;
+    if (tcpWriteFull(tcp_fd, rdma_g.local_name, rdma_g.local_name_len) < 0) return FI_ADDR_UNSPEC;
 
     /* Read peer name length */
-    n = read(tcp_fd, &peer_name_len, sizeof(peer_name_len));
-    if (n != sizeof(peer_name_len)) return FI_ADDR_UNSPEC;
+    if (tcpReadFull(tcp_fd, &peer_name_len, sizeof(peer_name_len)) < 0) return FI_ADDR_UNSPEC;
     peer_name_len = ntohl(peer_name_len);
-    if (peer_name_len > RDMA_MAX_EP_NAME) return FI_ADDR_UNSPEC;
+    if (peer_name_len == 0 || peer_name_len > RDMA_MAX_EP_NAME) return FI_ADDR_UNSPEC;
 
     /* Read peer name */
-    n = read(tcp_fd, peer_name, peer_name_len);
-    if (n != (ssize_t)peer_name_len) return FI_ADDR_UNSPEC;
+    if (tcpReadFull(tcp_fd, peer_name, peer_name_len) < 0) return FI_ADDR_UNSPEC;
 
     /* Insert into AV */
     ret = fi_av_insert(rdma_g.av, peer_name, 1, &addr, 0, NULL);
@@ -821,14 +836,10 @@ static void rdmaGlobalCqHandler(struct aeEventLoop *el, int fd, void *clientData
                       fi_strerror(err_entry.err),
                       fi_cq_strerror(rdma_g.cq, err_entry.prov_errno, err_entry.err_data, NULL, 0));
 
-            /* Try to find and signal the connection */
-            if (err_entry.flags & FI_RECV) {
-                /* For recv errors with source info */
-                rdma_conn = rdmaLookupConnection(src_addr);
-                if (rdma_conn) {
-                    rdma_conn->c.state = CONN_STATE_ERROR;
-                    rdmaSignalConnection(rdma_conn);
-                }
+            /* Try to find the connection via op_context if available */
+            if (err_entry.op_context) {
+                /* op_context is a ValkeyRdmaCmd* from send, or recv pool entry */
+                /* Cannot reliably map to connection, just log the error */
             }
             continue;
         }
@@ -1046,7 +1057,7 @@ rdmaAccept(aeEventLoop *el, connListener *listener, char *err, int fd, char *ip,
     ctx->ip = zstrdup(ip ? ip : "?");
     ctx->port = port ? *port : 0;
     ctx->peer_addr = peer_addr;
-    ctx->keepalive_te = aeCreateTimeEvent(el, VALKEY_RDMA_KEEPALIVE_MS, rdmaKeepaliveTimeProc, NULL, NULL);
+    ctx->keepalive_te = AE_ERR; /* will be set in connRdmaAcceptHandler with valid rdma_conn */
 
     if (rdmaSetupConnBufs(ctx) == C_ERR) {
         serverRdmaError(err, "RDMA: setup connection buffers failed");
@@ -1254,6 +1265,15 @@ static int connRdmaConnect(connection *conn,
     ctx->keepalive_te = aeCreateTimeEvent(server.el, VALKEY_RDMA_KEEPALIVE_MS, rdmaKeepaliveTimeProc, rdma_conn, NULL);
 
     if (aeCreateFileEvent(server.el, evfd, AE_READABLE, connRdmaEventHandler, conn) == AE_ERR) {
+        rdmaDelKeepalive(server.el, ctx);
+        rdmaUnregisterConnection(peer_addr);
+        rdmaDestroyConnBufs(ctx);
+        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        close(evfd);
+        zfree(ctx->ip);
+        zfree(ctx);
+        rdma_conn->ctx = NULL;
+        conn->fd = -1;
         return C_ERR;
     }
 
@@ -1337,6 +1357,14 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
     while (!ctx->tx.mr && (mstime() - start) < timeout) {
         aeWait(rdma_g.cq_fd, AE_READABLE, VALKEY_RDMA_SYNCIO_RES);
         rdmaGlobalCqHandler(NULL, rdma_g.cq_fd, NULL, 0);
+    }
+
+    /* Start keepalive */
+    ctx->keepalive_te = aeCreateTimeEvent(server.el, VALKEY_RDMA_KEEPALIVE_MS, rdmaKeepaliveTimeProc, rdma_conn, NULL);
+
+    /* Register ae handler for incoming data */
+    if (aeCreateFileEvent(server.el, evfd, AE_READABLE, connRdmaEventHandler, conn) == AE_ERR) {
+        serverLog(LL_WARNING, "RDMA: failed to register eventfd with ae (blocking connect)");
     }
 
     return C_OK;
@@ -1576,7 +1604,7 @@ wait:
     if (connRdmaWait(conn, start, timeout) == C_ERR) return C_ERR;
 
 copy:
-    for (toread = 0; toread <= ctx->rx.offset - ctx->rx.pos; toread++) {
+    for (toread = 0; toread < ctx->rx.offset - ctx->rx.pos; toread++) {
         c = ctx->rx.addr + ctx->rx.pos + toread;
         if (*c == '\n') {
             *c = '\0';
