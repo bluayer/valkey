@@ -136,18 +136,32 @@ cd tests/rdma && make
 python3 run.py
 ```
 
-### 3D. Cross-Compatibility Test
+### 3D. Cross-Compatibility Note
 
-Verify ibverbs client can talk to libfabric server (wire protocol unchanged):
+**Important**: The libfabric backend uses TCP handshake for address exchange,
+while the ibverbs backend uses RDMA CM (`rdma_connect`/`rdma_accept`).
+These are incompatible connection protocols, so:
 
+- **fabric server + ibverbs client = DOES NOT WORK**
+- **ibverbs server + fabric client = DOES NOT WORK**
+
+Both server and client must use the same backend. Since `valkey-cli` and
+`valkey-benchmark` use `deps/libvalkey/src/rdma.c` (ibverbs), they cannot
+connect to a fabric-backend server directly.
+
+**For testing, use TCP port as a workaround**:
 ```bash
-# Server: libfabric
+# Server: libfabric backend, but also enable TCP port for CLI access
 ./valkey-server-fabric --loadmodule ./valkey-rdma-fabric.so \
-  --port 0 --rdma-port 6379 --bind $SERVER_IP --protected-mode no
+  --port 6380 --rdma-port 6379 --bind $SERVER_IP --protected-mode no
 
-# Client: standard valkey-cli (uses libvalkey's ibverbs-based rdma.c)
-./src/valkey-cli -u rdma://$SERVER_IP:6379 PING
+# Client: connect via TCP for admin/testing
+./src/valkey-cli -h $SERVER_IP -p 6380 PING
 ```
+
+**For RDMA-to-RDMA testing**: A separate fabric-aware test client is needed,
+or the libvalkey RDMA client must be ported to libfabric as well.
+This is tracked as a future task.
 
 ---
 
@@ -155,22 +169,31 @@ Verify ibverbs client can talk to libfabric server (wire protocol unchanged):
 
 ### 4A. Benchmark Script
 
+**Note**: `valkey-benchmark` currently uses ibverbs RDMA, so direct RDMA
+benchmarking of the fabric backend is not yet possible. Use TCP for now:
+
 ```bash
 #!/bin/bash
-# perf_test.sh - Run on client node
+# perf_test.sh - Run on client node (TCP mode for both backends)
 SERVER_IP=$1
-BACKEND=$2  # "fabric" or "verbs"
+PORT=$2  # TCP port (e.g., 6380)
 
-echo "=== Valkey RDMA Performance Test: $BACKEND ==="
+echo "=== Valkey Performance Test (TCP) ==="
 
 for CLIENTS in 1 10 50 100; do
   for PAYLOAD in 64 256 1024 4096; do
     echo "--- clients=$CLIENTS payload=${PAYLOAD}B ---"
-    ./src/valkey-benchmark -u rdma://$SERVER_IP:6379 \
+    ./src/valkey-benchmark -h $SERVER_IP -p $PORT \
       -t set,get -n 500000 -c $CLIENTS -d $PAYLOAD \
       --csv 2>/dev/null | grep -E "SET|GET"
   done
 done
+```
+
+**For true RDMA benchmarking** (ibverbs backend only, as baseline):
+```bash
+./src/valkey-benchmark -u rdma://$SERVER_IP:6379 \
+  -t set,get -n 500000 -c 50 -d 256 --csv
 ```
 
 ### 4B. Test Matrix
@@ -267,6 +290,9 @@ aws ec2 delete-security-group --group-id $SG_ID
   use `fi_writemsg` with `FI_REMOTE_CQ_DATA` (equivalent to ibverbs
   `IBV_WR_RDMA_WRITE_WITH_IMM`).
 - **Client-side note**: The client (`deps/libvalkey/src/rdma.c`) still uses ibverbs
-  with FI_EP_MSG/rdma_cm. For EFA testing, both server and client must be on EFA
-  instances. The client's ibverbs RDMA path should work via EFA's ibverbs
-  compatibility layer (libibverbs + rdma_cm over EFA).
+  with rdma_cm. It uses a different connection protocol (RDMA CM) than the fabric
+  backend (TCP handshake), so **they are NOT cross-compatible**. Both sides must
+  use the same backend. A fabric-aware libvalkey client is a future task.
+- **Benchmarking limitation**: `valkey-benchmark` uses ibverbs RDMA, so it cannot
+  benchmark the fabric backend over RDMA directly. Use TCP port for benchmark
+  comparisons, or develop a fabric-aware benchmark client.
