@@ -363,10 +363,10 @@ RDMA_OBJ=rdma.o
 ifeq ($(RDMA_PROVIDER),fabric)
 	RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists libfabric && echo $$?)
 	ifeq ($(RDMA_PKGCONFIG),0)
-		RDMA_LIBS=$(shell $(PKG_CONFIG) --libs libfabric)
+		RDMA_LIBS=$(shell $(PKG_CONFIG) --libs libfabric) -lpthread
 		RDMA_INCLUDES=$(shell $(PKG_CONFIG) --cflags libfabric)
 	else
-		RDMA_LIBS=-lfabric
+		RDMA_LIBS=-lfabric -lpthread
 		RDMA_INCLUDES=
 	endif
 	RDMA_SRC=rdma_fabric.c

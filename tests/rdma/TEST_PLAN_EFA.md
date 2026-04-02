@@ -324,6 +324,8 @@ Why:
     connect via TCP, exchange `fi_getname` addresses, then communicate via RDMA.
   - **Address Vector (AV)**: `fi_av_insert()` registers peers after TCP handshake
   - **Global CQ**: `fi_cq_readfrom()` returns source address for demuxing
+  - **CQ polling thread**: Dedicated pthread polls CQ in tight loop (~10μs),
+    processes completions, signals per-connection eventfds
   - **eventfd per connection**: Bridges shared CQ to Valkey's per-fd ae event loop
 - **EFA provider**: Uses the `efa` provider (SRD protocol) with FI_EP_RDM.
   Set `FI_PROVIDER=efa` to force EFA provider (usually auto-detected):
@@ -340,7 +342,8 @@ Why:
     through the posted recv buffer mechanism, not through RMA target events.
   - `FI_WAIT_FD`: **NOT supported** by EFA provider in libfabric <=2.4.
     `fi_cq_open` with `FI_WAIT_FD` returns `-FI_ENOSYS`. The server uses
-    `FI_WAIT_NONE` + 1ms ae timer for CQ polling instead.
+    `FI_WAIT_NONE` + a dedicated CQ polling thread (replaces the earlier
+    1ms ae timer approach for lower latency; ~10μs poll interval).
   - **MR key size**: EFA uses 8-byte MR keys. The fabric wire protocol extends
     `ValkeyRdmaMemory.key` to `uint64_t` (the ibverbs backend uses `uint32_t`).
     This is safe because fabric and ibverbs backends cannot interoperate anyway.

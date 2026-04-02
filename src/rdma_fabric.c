@@ -42,6 +42,7 @@
 #include <sys/eventfd.h>
 #include <netdb.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 #ifndef container_of
 #define container_of(ptr, type, member) \
@@ -181,7 +182,8 @@ typedef struct RdmaGlobal {
     struct fid_ep *ep;
     struct fid_av *av;
     struct fid_cq *cq;
-    long long cq_poll_timer;    /* ae timer for CQ polling (EFA: no FI_WAIT_FD) */
+    pthread_t cq_thread;            /* dedicated CQ polling thread */
+    volatile int cq_thread_running; /* flag to stop the thread */
 
     /* Global recv buffer pool */
     ValkeyRdmaCmd *recv_pool;
@@ -223,12 +225,18 @@ static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientDat
 static void rdmaGlobalCqHandler(struct aeEventLoop *el, int fd, void *clientData, int mask);
 static int rdmaProcessPendingData(void);
 
-/* CQ polling timer callback (EFA does not support FI_WAIT_FD in libfabric <=2.4) */
-static int rdmaCqPollTimerProc(struct aeEventLoop *el, long long id, void *clientData) {
-    UNUSED(id);
-    UNUSED(clientData);
-    rdmaGlobalCqHandler(el, -1, NULL, 0);
-    return 1; /* re-arm: fire again in 1ms */
+/* CQ polling thread — replaces timer-based polling for lower latency.
+ * Tight loop: poll CQ, dispatch completions, signal per-connection eventfds.
+ * When CQ is empty, usleep(10) to yield CPU (~100K polls/sec). */
+static void *rdmaCqPollingThread(void *arg) {
+    UNUSED(arg);
+    while (rdma_g.cq_thread_running) {
+        rdmaGlobalCqHandler(NULL, -1, NULL, 0);
+        /* Brief yield when no completions — avoids burning a full core.
+         * 10μs gives ~100K polls/sec, much better than 1ms timer. */
+        usleep(10);
+    }
+    return NULL;
 }
 
 /* ========================================================================
@@ -481,10 +489,11 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     }
     rdma_g.recv_pool_posted = RDMA_RECV_POOL_SIZE;
 
-    /* Poll CQ via ae timer (1ms interval) */
-    rdma_g.cq_poll_timer = aeCreateTimeEvent(server.el, 1, rdmaCqPollTimerProc, NULL, NULL);
-    if (rdma_g.cq_poll_timer == AE_ERR) {
-        serverLog(LL_WARNING, "RDMA: failed to create CQ polling timer");
+    /* Start dedicated CQ polling thread */
+    rdma_g.cq_thread_running = 1;
+    if (pthread_create(&rdma_g.cq_thread, NULL, rdmaCqPollingThread, NULL) != 0) {
+        serverLog(LL_WARNING, "RDMA: failed to create CQ polling thread");
+        rdma_g.cq_thread_running = 0;
         goto err;
     }
 
@@ -501,9 +510,9 @@ err:
 static void rdmaGlobalCleanup(void) {
     if (!rdma_g.initialized) return;
 
-    if (rdma_g.cq_poll_timer != AE_ERR) {
-        aeDeleteTimeEvent(server.el, rdma_g.cq_poll_timer);
-        rdma_g.cq_poll_timer = AE_ERR;
+    if (rdma_g.cq_thread_running) {
+        rdma_g.cq_thread_running = 0;
+        pthread_join(rdma_g.cq_thread, NULL);
     }
 
     if (rdma_g.recv_pool_mr) fi_close(&rdma_g.recv_pool_mr->fid);
@@ -1399,10 +1408,10 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
 
     connRdmaRegisterRx(ctx);
 
-    /* Wait for remote to send us their RX registration */
+    /* Wait for remote to send us their RX registration.
+     * CQ polling thread processes completions and signals eventfds. */
     while (!ctx->tx.mr && (mstime() - start) < timeout) {
-        rdmaGlobalCqHandler(NULL, -1, NULL, 0);
-        if (!ctx->tx.mr) usleep(100);
+        usleep(100);
     }
 
     /* Start keepalive */
@@ -1575,12 +1584,8 @@ static int connRdmaWait(connection *conn, long start, long timeout) {
         return C_ERR;
     }
 
-    /* Busy-poll CQ (EFA: no FI_WAIT_FD) */
-    long long poll_start = mstime();
-    while (mstime() - poll_start < wait) {
-        rdmaGlobalCqHandler(NULL, -1, NULL, 0);
-        usleep(100);
-    }
+    /* CQ polling thread handles completions; just wait here */
+    usleep(wait * 1000);
 
     return C_OK;
 }
