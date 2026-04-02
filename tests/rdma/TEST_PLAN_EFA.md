@@ -79,6 +79,12 @@ sudo ./efa_installer.sh -y
 fi_info -p efa         # Should list efa provider
 fi_info -p verbs       # Should list verbs provider (for ibverbs comparison)
 
+# Check provider capabilities (MR key size, modes, etc.)
+cd valkey/tests/rdma
+gcc -o test_mr_key_size test_mr_key_size.c -lfabric \
+  -I/opt/amazon/efa/include -L/opt/amazon/efa/lib64
+./test_mr_key_size efa
+
 # Build dependencies
 sudo yum install -y gcc make pkgconfig  # AL2023
 # or: sudo apt install -y gcc make pkg-config  # Ubuntu
@@ -159,9 +165,19 @@ connect to a fabric-backend server directly.
 ./src/valkey-cli -h $SERVER_IP -p 6380 PING
 ```
 
-**For RDMA-to-RDMA testing**: A separate fabric-aware test client is needed,
-or the libvalkey RDMA client must be ported to libfabric as well.
-This is tracked as a future task.
+**For RDMA-to-RDMA testing**, use the fabric test client:
+```bash
+# Build the fabric test client (on client node)
+cd tests/rdma
+gcc -o rdma-test-fabric rdma-test-fabric.c -lfabric -lpthread \
+  -I/opt/amazon/efa/include -L/opt/amazon/efa/lib64
+
+# Run against fabric server (PING, SET/GET, BGSAVE tests)
+./rdma-test-fabric -h $SERVER_IP -p 6379
+
+# Multi-threaded test
+./rdma-test-fabric -h $SERVER_IP -p 6379 -t 4
+```
 
 ---
 
@@ -280,14 +296,35 @@ aws ec2 delete-security-group --group-id $SG_ID
   - **Address Vector (AV)**: `fi_av_insert()` registers peers after TCP handshake
   - **Global CQ**: `fi_cq_readfrom()` returns source address for demuxing
   - **eventfd per connection**: Bridges shared CQ to Valkey's per-fd ae event loop
-- **EFA provider**: Should work directly with the `efa` provider (SRD protocol).
-  The implementation handles `FI_MR_ENDPOINT` mode which EFA requires.
+- **EFA provider**: Uses the `efa` provider (SRD protocol) with FI_EP_RDM.
   Set `FI_PROVIDER=efa` to force EFA provider (usually auto-detected):
   ```bash
   export FI_PROVIDER=efa
   ```
-- **Wire protocol**: The 32-byte ValkeyRdmaCmd format is unchanged. RDMA writes
-  use `fi_writemsg` with `FI_REMOTE_CQ_DATA` (equivalent to ibverbs
+- **EFA-specific capabilities and limitations**:
+  - `FI_MR_ENDPOINT`: EFA requires MR bound to endpoint. Handled automatically.
+  - `FI_CONTEXT2`: EFA requires 64-byte operation context. The code uses `RdmaOpCtx`
+    wrapper struct (fi_context2 + user_data pointer) for all operations.
+  - `FI_RX_CQ_DATA`: EFA requires this mode for receiving immediate data. Set in hints.
+  - `FI_RMA_EVENT`: **NOT supported** by EFA. Not needed — our data path uses
+    `fi_writemsg` + `FI_REMOTE_CQ_DATA` which generates receive completions
+    through the posted recv buffer mechanism, not through RMA target events.
+  - `FI_WAIT_FD`: Supported by EFA for CQ notification **when SHM is disabled**.
+    Cross-node RDMA disables SHM automatically. If using loopback testing on a
+    single EFA instance, set `FI_EFA_USE_SHM=0` to avoid FI_WAIT_FD failures:
+    ```bash
+    export FI_EFA_USE_SHM=0
+    ```
+  - **MR key size**: EFA uses 8-byte MR keys. The fabric wire protocol extends
+    `ValkeyRdmaMemory.key` to `uint64_t` (the ibverbs backend uses `uint32_t`).
+    This is safe because fabric and ibverbs backends cannot interoperate anyway.
+- **Wire protocol**: The 32-byte ValkeyRdmaCmd union size is preserved. The fabric
+  backend uses a modified `ValkeyRdmaMemory` layout with 64-bit key field:
+  ```
+  ibverbs: opcode(2) + rsvd(14) + addr(8) + length(4) + key(4)  = 32
+  fabric:  opcode(2) + rsvd(6)  + addr(8) + key(8) + length(4) + rsvd2(4) = 32
+  ```
+  RDMA writes use `fi_writemsg` with `FI_REMOTE_CQ_DATA` (equivalent to ibverbs
   `IBV_WR_RDMA_WRITE_WITH_IMM`).
 - **Client-side note**: The client (`deps/libvalkey/src/rdma.c`) still uses ibverbs
   with rdma_cm. It uses a different connection protocol (RDMA CM) than the fabric
