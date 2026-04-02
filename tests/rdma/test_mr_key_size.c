@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    hints->caps = FI_MSG | FI_RMA | FI_RMA_EVENT | FI_SOURCE;
+    hints->caps = FI_MSG | FI_RMA | FI_SOURCE;
     hints->ep_attr->type = FI_EP_RDM;
     hints->mode = FI_CONTEXT2 | FI_RX_CQ_DATA;
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;

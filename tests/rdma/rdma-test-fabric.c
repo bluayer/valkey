@@ -25,7 +25,6 @@
 #include <getopt.h>
 #include <limits.h>
 #include <netdb.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -483,10 +482,6 @@ static ssize_t valkeyRdmaRead(FabricContext *ctx, char *buf, size_t data_len) {
     long timed = 3000;
     long start = valkeyNowMs();
     uint32_t toread, remained;
-    int cq_fd;
-    struct pollfd pfd;
-
-    fi_control(&ctx->cq->fid, FI_GETWAIT, &cq_fd);
 
 copy:
     if (ctx->recv_offset < ctx->rx_offset) {
@@ -505,10 +500,7 @@ pollcq:
     if (connRdmaHandleCq(ctx) == -1) return -1;
     if (ctx->recv_offset < ctx->rx_offset) goto copy;
 
-    pfd.fd = cq_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-    poll(&pfd, 1, 100);
+    usleep(100);  /* 100us busy-poll (EFA: no FI_WAIT_FD) */
 
     if ((valkeyNowMs() - start) < timed) goto pollcq;
 
@@ -568,17 +560,11 @@ static ssize_t valkeyRdmaWrite(FabricContext *ctx, char *buf, size_t data_len) {
     long start = valkeyNowMs();
     uint32_t towrite, wrote = 0;
     size_t ret;
-    int cq_fd;
-    struct pollfd pfd;
 
-    fi_control(&ctx->cq->fid, FI_GETWAIT, &cq_fd);
     goto pollcq;
 
 waitcq:
-    pfd.fd = cq_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-    poll(&pfd, 1, 1);
+    usleep(100);  /* 100us busy-poll (EFA: no FI_WAIT_FD) */
 
 pollcq:
     if (connRdmaHandleCq(ctx) == -1) return -1;
@@ -642,7 +628,7 @@ static FabricContext *valkeyContextConnectFabric(const char *addr, int port, int
     /* Get fabric info */
     hints = fi_allocinfo();
     if (!hints) goto err;
-    hints->caps = FI_MSG | FI_RMA | FI_RMA_EVENT | FI_SOURCE;
+    hints->caps = FI_MSG | FI_RMA | FI_SOURCE;
     hints->ep_attr->type = FI_EP_RDM;
     hints->mode = FI_CONTEXT2 | FI_RX_CQ_DATA;
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
@@ -668,7 +654,7 @@ static FabricContext *valkeyContextConnectFabric(const char *addr, int port, int
     if (cq_attr.size < (size_t)(VALKEY_RDMA_MAX_WQE * 4))
         cq_attr.size = VALKEY_RDMA_MAX_WQE * 4;
     cq_attr.format = FI_CQ_FORMAT_DATA;
-    cq_attr.wait_obj = FI_WAIT_FD;
+    cq_attr.wait_obj = FI_WAIT_NONE;
     ret = fi_cq_open(ctx->domain, &cq_attr, &ctx->cq, NULL);
     if (ret) goto err;
 
@@ -727,13 +713,8 @@ static FabricContext *valkeyContextConnectFabric(const char *addr, int port, int
 
     /* Wait for server to send us its RX registration */
     while (!ctx->send_buf && (valkeyNowMs() - start) < 3000) {
-        struct pollfd pfd;
-        int cq_fd;
-        fi_control(&ctx->cq->fid, FI_GETWAIT, &cq_fd);
-        pfd.fd = cq_fd;
-        pfd.events = POLLIN;
-        poll(&pfd, 1, 100);
         connRdmaHandleCq(ctx);
+        if (!ctx->send_buf) usleep(100);  /* 100us busy-poll */
     }
 
     if (!ctx->send_buf) {
