@@ -338,12 +338,9 @@ Why:
   - `FI_RMA_EVENT`: **NOT supported** by EFA. Not needed — our data path uses
     `fi_writemsg` + `FI_REMOTE_CQ_DATA` which generates receive completions
     through the posted recv buffer mechanism, not through RMA target events.
-  - `FI_WAIT_FD`: Supported by EFA for CQ notification **when SHM is disabled**.
-    Cross-node RDMA disables SHM automatically. If using loopback testing on a
-    single EFA instance, set `FI_EFA_USE_SHM=0` to avoid FI_WAIT_FD failures:
-    ```bash
-    export FI_EFA_USE_SHM=0
-    ```
+  - `FI_WAIT_FD`: **NOT supported** by EFA provider in libfabric <=2.4.
+    `fi_cq_open` with `FI_WAIT_FD` returns `-FI_ENOSYS`. The server uses
+    `FI_WAIT_NONE` + 1ms ae timer for CQ polling instead.
   - **MR key size**: EFA uses 8-byte MR keys. The fabric wire protocol extends
     `ValkeyRdmaMemory.key` to `uint64_t` (the ibverbs backend uses `uint32_t`).
     This is safe because fabric and ibverbs backends cannot interoperate anyway.

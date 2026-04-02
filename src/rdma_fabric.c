@@ -181,7 +181,7 @@ typedef struct RdmaGlobal {
     struct fid_ep *ep;
     struct fid_av *av;
     struct fid_cq *cq;
-    int cq_fd;                  /* CQ wait fd for ae event loop integration */
+    long long cq_poll_timer;    /* ae timer for CQ polling (EFA: no FI_WAIT_FD) */
 
     /* Global recv buffer pool */
     ValkeyRdmaCmd *recv_pool;
@@ -222,6 +222,14 @@ static RdmaGlobal rdma_g;
 static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask);
 static void rdmaGlobalCqHandler(struct aeEventLoop *el, int fd, void *clientData, int mask);
 static int rdmaProcessPendingData(void);
+
+/* CQ polling timer callback (EFA does not support FI_WAIT_FD in libfabric <=2.4) */
+static int rdmaCqPollTimerProc(struct aeEventLoop *el, long long id, void *clientData) {
+    UNUSED(id);
+    UNUSED(clientData);
+    rdmaGlobalCqHandler(el, -1, NULL, 0);
+    return 1; /* re-arm: fire again in 1ms */
+}
 
 /* ========================================================================
  * Utility functions
@@ -334,7 +342,7 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     struct fi_info *hints, *fi;
     struct fi_cq_attr cq_attr = {0};
     struct fi_av_attr av_attr = {0};
-    int ret, fd;
+    int ret;
 
     if (rdma_g.initialized) return C_OK;
 
@@ -376,27 +384,19 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
         goto err;
     }
 
-    /* CQ with FI_WAIT_FD for ae event loop integration.
-     * EFA supports FI_WAIT_FD when SHM is disabled (cross-node RDMA). */
+    /* CQ with FI_WAIT_NONE — EFA provider (libfabric <=2.4) does not
+     * support FI_WAIT_FD. CQ is drained by a periodic ae timer. */
     cq_attr.size = fi->tx_attr->size + fi->rx_attr->size;
     if (cq_attr.size < (size_t)(VALKEY_RDMA_MAX_WQE * 4)) {
         cq_attr.size = VALKEY_RDMA_MAX_WQE * 4;
     }
     cq_attr.format = FI_CQ_FORMAT_DATA;
-    cq_attr.wait_obj = FI_WAIT_FD;
+    cq_attr.wait_obj = FI_WAIT_NONE;
     ret = fi_cq_open(rdma_g.domain, &cq_attr, &rdma_g.cq, NULL);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_cq_open failed: %s", fi_strerror(-ret));
         goto err;
     }
-
-    ret = fi_control(&rdma_g.cq->fid, FI_GETWAIT, &fd);
-    if (ret) {
-        serverLog(LL_WARNING, "RDMA: FI_GETWAIT on CQ failed: %s", fi_strerror(-ret));
-        goto err;
-    }
-    rdma_g.cq_fd = fd;
-    anetNonBlock(NULL, fd);
 
     /* Address vector */
     av_attr.type = FI_AV_TABLE;
@@ -481,9 +481,10 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     }
     rdma_g.recv_pool_posted = RDMA_RECV_POOL_SIZE;
 
-    /* Register CQ fd with ae for completion notification */
-    if (aeCreateFileEvent(server.el, rdma_g.cq_fd, AE_READABLE, rdmaGlobalCqHandler, NULL) == AE_ERR) {
-        serverLog(LL_WARNING, "RDMA: failed to register CQ fd with event loop");
+    /* Poll CQ via ae timer (1ms interval) */
+    rdma_g.cq_poll_timer = aeCreateTimeEvent(server.el, 1, rdmaCqPollTimerProc, NULL, NULL);
+    if (rdma_g.cq_poll_timer == AE_ERR) {
+        serverLog(LL_WARNING, "RDMA: failed to create CQ polling timer");
         goto err;
     }
 
@@ -500,8 +501,9 @@ err:
 static void rdmaGlobalCleanup(void) {
     if (!rdma_g.initialized) return;
 
-    if (rdma_g.cq_fd >= 0) {
-        aeDeleteFileEvent(server.el, rdma_g.cq_fd, AE_READABLE);
+    if (rdma_g.cq_poll_timer != AE_ERR) {
+        aeDeleteTimeEvent(server.el, rdma_g.cq_poll_timer);
+        rdma_g.cq_poll_timer = AE_ERR;
     }
 
     if (rdma_g.recv_pool_mr) fi_close(&rdma_g.recv_pool_mr->fid);
@@ -1399,8 +1401,8 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
 
     /* Wait for remote to send us their RX registration */
     while (!ctx->tx.mr && (mstime() - start) < timeout) {
-        aeWait(rdma_g.cq_fd, AE_READABLE, VALKEY_RDMA_SYNCIO_RES);
-        rdmaGlobalCqHandler(NULL, rdma_g.cq_fd, NULL, 0);
+        rdmaGlobalCqHandler(NULL, -1, NULL, 0);
+        if (!ctx->tx.mr) usleep(100);
     }
 
     /* Start keepalive */
@@ -1573,8 +1575,12 @@ static int connRdmaWait(connection *conn, long start, long timeout) {
         return C_ERR;
     }
 
-    aeWait(rdma_g.cq_fd, AE_READABLE, wait);
-    rdmaGlobalCqHandler(NULL, rdma_g.cq_fd, NULL, 0);
+    /* Busy-poll CQ (EFA: no FI_WAIT_FD) */
+    long long poll_start = mstime();
+    while (mstime() - poll_start < wait) {
+        rdmaGlobalCqHandler(NULL, -1, NULL, 0);
+        usleep(100);
+    }
 
     return C_OK;
 }
