@@ -224,22 +224,28 @@ done
 | GET 4KB, 100 clients     | throughput MB/s  | fabric within 10% of verbs             |
 | Long-running (10min)      | stability        | No crashes, no memory leaks            |
 | Reconnection              | connectivity     | Client reconnects after server restart |
+| CQ thread idle CPU        | %CPU (top -H)    | < 1% CPU when no RDMA traffic          |
+| CQ thread under load      | %CPU (top -H)    | Scales with traffic, no 100% spin      |
+| Graceful shutdown          | exit time        | Server exits within 2s on SIGTERM      |
 
 ### 4C. Comparison Procedure
 
+Both backends must expose a TCP port for `valkey-benchmark` (since it uses
+ibverbs RDMA which is incompatible with the fabric backend):
+
 ```bash
-# 1. Run server with ibverbs backend, benchmark, save results
+# 1. Run server with ibverbs backend (TCP benchmark)
 ./valkey-server-verbs --loadmodule ./valkey-rdma-verbs.so \
-  --port 0 --rdma-port 6379 \
+  --port 6380 --rdma-port 6379 \
   --bind $SERVER_IP --rdma-bind $SERVER_IP --protected-mode no &
-bash perf_test.sh $SERVER_IP verbs > results_verbs.csv
+bash perf_test.sh $SERVER_IP 6380 > results_verbs.csv
 kill %1
 
-# 2. Run server with libfabric backend, benchmark, save results
+# 2. Run server with libfabric backend (TCP benchmark)
 ./valkey-server-fabric --loadmodule ./valkey-rdma-fabric.so \
-  --port 0 --rdma-port 6379 \
+  --port 6380 --rdma-port 6379 \
   --bind $SERVER_IP --rdma-bind $SERVER_IP --protected-mode no &
-bash perf_test.sh $SERVER_IP fabric > results_fabric.csv
+bash perf_test.sh $SERVER_IP 6380 > results_fabric.csv
 kill %1
 
 # 3. Compare
@@ -247,19 +253,61 @@ diff results_verbs.csv results_fabric.csv
 # or use a script to compute % differences
 ```
 
+**Note**: TCP benchmarks measure server overhead (command processing, memory
+allocation) but NOT the RDMA data path. For true RDMA path comparison, use
+the fabric test client (`rdma-test-fabric`) for the fabric backend and
+`valkey-benchmark -u rdma://` for the ibverbs backend, then compare
+qualitatively.
+
 ---
 
 ## 5. Stability Tests
 
-```bash
-# Long-running test (10 minutes, mixed workload)
-./src/valkey-benchmark -u rdma://$SERVER_IP:6379 \
-  -t set,get,incr,lpush,rpush,sadd -n 10000000 -c 50 -d 256
+### 5A. Long-Running Workload
 
-# Memory leak check (compare RSS before/after)
-ps -o rss -p $(pgrep valkey-server) # before
-# ... run benchmark ...
-ps -o rss -p $(pgrep valkey-server) # after
+**Note**: `valkey-benchmark -u rdma://` uses ibverbs and cannot connect to the
+fabric backend. Use the fabric test client or TCP benchmark instead.
+
+```bash
+# Option 1: Fabric test client (true RDMA path, multi-threaded)
+./rdma-test-fabric -h $SERVER_IP -p 6379 -t 4
+
+# Option 2: TCP benchmark (higher volume, but tests server stability not RDMA path)
+./src/valkey-benchmark -h $SERVER_IP -p 6380 \
+  -t set,get,incr,lpush,rpush,sadd -n 10000000 -c 50 -d 256
+```
+
+### 5B. Memory Leak Check
+
+```bash
+# Check RSS before and after a long workload
+ps -o rss -p $(pgrep valkey-server)  # before
+# ... run workload ...
+ps -o rss -p $(pgrep valkey-server)  # after
+```
+
+### 5C. CQ Polling Thread Verification
+
+The fabric backend uses a dedicated CQ polling thread instead of a timer.
+Verify it is running and behaving correctly:
+
+```bash
+# 1. Confirm the CQ polling thread exists
+ps -T -p $(pgrep valkey-server) | grep valkey
+# Should show at least 2 threads (main + CQ polling)
+
+# 2. Monitor CQ thread CPU usage during idle (should be near 0% due to usleep)
+top -H -p $(pgrep valkey-server)
+# The CQ polling thread should use minimal CPU when no RDMA traffic
+
+# 3. Monitor CQ thread CPU usage under load
+#    Run fabric test client in another terminal, then check top -H again.
+#    The CQ polling thread CPU should increase proportionally to RDMA traffic.
+
+# 4. Graceful shutdown — verify thread joins cleanly (no hang on SIGTERM)
+kill $(pgrep valkey-server)
+# Server should exit within 1-2 seconds. If it hangs, the pthread_join
+# may be stuck — check that cq_thread_running flag is cleared.
 ```
 
 ---
