@@ -392,6 +392,24 @@ Why:
     `fi_cq_open` with `FI_WAIT_FD` returns `-FI_ENOSYS`. The server uses
     `FI_WAIT_NONE` + a dedicated CQ polling thread (replaces the earlier
     1ms ae timer approach for lower latency; ~10μs poll interval).
+  - **Thread safety (fabric_mutex)**: The CQ polling thread and main (ae) thread
+    both access shared fabric objects (EP, CQ, AV). EFA's `FI_THREAD_DOMAIN`
+    threading model does NOT guarantee same-object concurrent access safety.
+    A `PTHREAD_MUTEX_RECURSIVE` mutex (`fabric_mutex`) serializes all fabric
+    operations. Recursive is required because the CQ thread holds the lock
+    while `rdmaGlobalCqHandler` internally calls `rdmaPostRecv`/`rdmaSendCommand`
+    which also acquire the lock.
+    - **Performance note**: Recursive mutex adds ~5-10ns overhead vs normal mutex
+      (~30ns vs ~25ns per lock/unlock). This is negligible compared to
+      `fi_sendmsg` (~200-500ns) and network RTT (~5-10μs). Current contention
+      is low since the CQ thread releases the lock during `usleep(10)`.
+    - **Future optimization**: If profiling shows mutex contention as a
+      bottleneck under high connection counts, consider replacing with:
+      (1) lock-free ring buffer between CQ thread and main thread (CQ thread
+      only reads CQ, enqueues completions; main thread dequeues and processes),
+      or (2) `pthread_spin_lock` for lower uncontended latency (~10ns), or
+      (3) restructure so CQ thread only touches CQ and main thread handles
+      all EP/AV operations via deferred work queue.
   - **MR key size**: EFA uses 8-byte MR keys. The fabric wire protocol extends
     `ValkeyRdmaMemory.key` to `uint64_t` (the ibverbs backend uses `uint32_t`).
     This is safe because fabric and ibverbs backends cannot interoperate anyway.
