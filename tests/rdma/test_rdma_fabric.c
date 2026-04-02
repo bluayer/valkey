@@ -40,10 +40,11 @@ typedef struct ValkeyRdmaKeepalive {
 
 typedef struct ValkeyRdmaMemory {
     uint16_t opcode;
-    uint8_t rsvd[14];
+    uint8_t rsvd[6];
     uint64_t addr;
+    uint64_t key;
     uint32_t length;
-    uint32_t key;
+    uint32_t rsvd2;
 } ValkeyRdmaMemory;
 
 typedef union ValkeyRdmaCmd {
@@ -164,19 +165,19 @@ TEST(wire_protocol_register_xfer_memory) {
     ValkeyRdmaCmd cmd = {0};
     uint64_t test_addr = 0x7f1234560000ULL;
     uint32_t test_length = 1024 * 1024;
-    uint32_t test_key = 42;
+    uint64_t test_key = 0xDEADBEEF12345678ULL; /* 64-bit key for EFA */
 
     /* Serialize (as rdma_fabric.c does in connRdmaRegisterRx) */
     cmd.memory.opcode = htons(RegisterXferMemory);
     cmd.memory.addr = htonu64(test_addr);
     cmd.memory.length = htonl(test_length);
-    cmd.memory.key = htonl(test_key);
+    cmd.memory.key = htonu64(test_key);
 
     /* Deserialize (as rdma_fabric.c does in connRdmaHandleRecv) */
     ASSERT_EQ(ntohs(cmd.memory.opcode), RegisterXferMemory);
     ASSERT_EQ(ntohu64(cmd.memory.addr), test_addr);
     ASSERT_EQ(ntohl(cmd.memory.length), test_length);
-    ASSERT_EQ(ntohl(cmd.memory.key), test_key);
+    ASSERT_EQ(ntohu64(cmd.memory.key), test_key);
 }
 
 /* ========================================================================
@@ -629,25 +630,26 @@ TEST(wire_protocol_union_overlay) {
     cmd.memory.opcode = htons(RegisterXferMemory);
     cmd.memory.addr = htonu64(0x1234);
     cmd.memory.length = htonl(4096);
-    cmd.memory.key = htonl(99);
+    cmd.memory.key = htonu64(99);
 
     /* Verify opcode readable via keepalive union member */
     ASSERT_EQ(ntohs(cmd.keepalive.opcode), RegisterXferMemory);
 
-    /* Verify Memory struct field positions by checking raw bytes */
+    /* Verify Memory struct field positions by checking raw bytes.
+     * Fabric layout: opcode(2) + rsvd(6) + addr(8) + key(8) + length(4) + rsvd2(4) */
     uint8_t *raw = (uint8_t *)&cmd;
     /* opcode at offset 0-1 */
     ASSERT_EQ(raw[0], (RegisterXferMemory >> 8) & 0xff);
     ASSERT_EQ(raw[1], RegisterXferMemory & 0xff);
-    /* addr at offset 16-23 (opcode 2 + rsvd 14 = 16) */
-    uint64_t *addr_ptr = (uint64_t *)(raw + 16);
+    /* addr at offset 8-15 (opcode 2 + rsvd 6 = 8) */
+    uint64_t *addr_ptr = (uint64_t *)(raw + 8);
     ASSERT_EQ(ntohu64(*addr_ptr), 0x1234);
+    /* key at offset 16-23 */
+    uint64_t *key_ptr = (uint64_t *)(raw + 16);
+    ASSERT_EQ(ntohu64(*key_ptr), 99);
     /* length at offset 24-27 */
     uint32_t *len_ptr = (uint32_t *)(raw + 24);
     ASSERT_EQ(ntohl(*len_ptr), 4096);
-    /* key at offset 28-31 */
-    uint32_t *key_ptr = (uint32_t *)(raw + 28);
-    ASSERT_EQ(ntohl(*key_ptr), 99);
 }
 
 /* ========================================================================

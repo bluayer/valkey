@@ -58,12 +58,14 @@ typedef struct valkeyRdmaKeepalive {
     uint8_t rsvd[30];
 } valkeyRdmaKeepalive;
 
+/* Fabric backend: 64-bit key (matches rdma_fabric.c, NOT ibverbs rdma.c) */
 typedef struct valkeyRdmaMemory {
     uint16_t opcode;
-    uint8_t rsvd[14];
+    uint8_t rsvd[6];
     uint64_t addr;
+    uint64_t key;
     uint32_t length;
-    uint32_t key;
+    uint32_t rsvd2;
 } valkeyRdmaMemory;
 
 typedef union valkeyRdmaCmd {
@@ -387,7 +389,7 @@ static int connRdmaRegisterRx(FabricContext *ctx) {
     cmd.memory.opcode = htons(RegisterXferMemory);
     cmd.memory.addr = htobe64((uint64_t)(uintptr_t)ctx->recv_buf);
     cmd.memory.length = htonl(ctx->recv_length);
-    cmd.memory.key = htonl(fi_mr_key(ctx->recv_mr));
+    cmd.memory.key = htobe64(fi_mr_key(ctx->recv_mr));
 
     ctx->rx_offset = 0;
     ctx->recv_offset = 0;
@@ -405,7 +407,7 @@ static int connRdmaHandleRecv(FabricContext *ctx, valkeyRdmaCmd *cmd, uint32_t b
     case RegisterXferMemory:
         ctx->tx_addr = (char *)(uintptr_t)be64toh(cmd->memory.addr);
         ctx->tx_length = ntohl(cmd->memory.length);
-        ctx->tx_key = ntohl(cmd->memory.key);
+        ctx->tx_key = be64toh(cmd->memory.key);
         ctx->tx_offset = 0;
         rdmaAdjustSendbuf(ctx, ctx->tx_length);
         break;

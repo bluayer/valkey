@@ -49,11 +49,11 @@ int main(int argc, char **argv) {
     printf("MR mode:       0x%lx\n", (unsigned long)fi->domain_attr->mr_mode);
     printf("MR key size:   %zu bytes\n", fi->domain_attr->mr_key_size);
 
-    if (fi->domain_attr->mr_key_size > 4) {
-        printf("\n** WARNING: MR key exceeds 32-bit — wire protocol incompatible **\n");
-        exit_code = 2;
+    if (fi->domain_attr->mr_key_size <= 8) {
+        printf("\n   OK: MR key size supported by fabric wire protocol (64-bit)\n");
     } else {
-        printf("\n   OK: MR key fits in 32-bit wire protocol\n");
+        printf("\n** WARNING: MR key exceeds 64-bit — unsupported **\n");
+        exit_code = 2;
     }
 
     /* Try to actually register memory and check the key value */
@@ -80,11 +80,7 @@ int main(int argc, char **argv) {
     uint64_t key = fi_mr_key(mr);
     printf("fi_mr_key():   0x%016lx\n", (unsigned long)key);
     printf("Fits 32-bit:   %s\n", (key <= 0xFFFFFFFF) ? "YES" : "NO");
-
-    if (key > 0xFFFFFFFF) {
-        printf("\n** WARNING: actual key value exceeds 32-bit! **\n");
-        exit_code = 2;
-    }
+    printf("Fits 64-bit:   YES (always)\n");
 
     /* Try a second registration to see if keys increment predictably */
     struct fid_mr *mr2 = NULL;

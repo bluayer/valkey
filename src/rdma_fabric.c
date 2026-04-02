@@ -64,12 +64,17 @@ typedef struct ValkeyRdmaKeepalive {
     uint8_t rsvd[30];
 } ValkeyRdmaKeepalive;
 
+/* Fabric backend: key extended to uint64_t for EFA (8-byte MR keys).
+ * rsvd reduced from 14 to 6 bytes to maintain 32-byte struct size.
+ * This is NOT wire-compatible with ibverbs rdma.c, but fabric and ibverbs
+ * clients cannot interoperate anyway (different connection establishment). */
 typedef struct ValkeyRdmaMemory {
     uint16_t opcode;
-    uint8_t rsvd[14];
+    uint8_t rsvd[6];
     uint64_t addr;
+    uint64_t key;
     uint32_t length;
-    uint32_t key;
+    uint32_t rsvd2;
 } ValkeyRdmaMemory;
 
 typedef union ValkeyRdmaCmd {
@@ -77,6 +82,8 @@ typedef union ValkeyRdmaCmd {
     ValkeyRdmaKeepalive keepalive;
     ValkeyRdmaMemory memory;
 } ValkeyRdmaCmd;
+
+_Static_assert(sizeof(ValkeyRdmaCmd) == 32, "ValkeyRdmaCmd must be 32 bytes");
 
 /* Operation context wrapper for FI_CONTEXT2 (EFA requires 64-byte context).
  * fi_ctx MUST be the first member — provider writes into it directly. */
@@ -354,13 +361,8 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
         serverLog(LL_VERBOSE, "RDMA: provider requires FI_MR_ENDPOINT");
     }
 
-    /* Wire protocol only supports 32-bit rkey — reject providers with larger keys */
-    if (fi->domain_attr->mr_key_size > 4) {
-        serverLog(LL_WARNING, "RDMA: provider uses %zu-byte MR keys, "
-                  "but wire protocol only supports 32-bit rkey",
-                  fi->domain_attr->mr_key_size);
-        goto err;
-    }
+    serverLog(LL_VERBOSE, "RDMA: provider MR key size: %zu bytes",
+              fi->domain_attr->mr_key_size);
 
     ret = fi_fabric(fi->fabric_attr, &rdma_g.fabric, NULL);
     if (ret) {
@@ -783,7 +785,7 @@ static int connRdmaRegisterRx(RdmaContext *ctx) {
     cmd.memory.opcode = htons(RegisterXferMemory);
     cmd.memory.addr = htonu64((uint64_t)(uintptr_t)ctx->rx.addr);
     cmd.memory.length = htonl(ctx->rx.length);
-    cmd.memory.key = htonl(fi_mr_key(ctx->rx.mr));
+    cmd.memory.key = htonu64(fi_mr_key(ctx->rx.mr));
 
     ctx->rx.offset = 0;
     ctx->rx.pos = 0;
@@ -823,7 +825,7 @@ static int connRdmaHandleRecv(RdmaContext *ctx, ValkeyRdmaCmd *cmd, uint32_t byt
     case RegisterXferMemory:
         ctx->tx_addr = (char *)(uintptr_t)ntohu64(cmd->memory.addr);
         ctx->tx.length = ntohl(cmd->memory.length);
-        ctx->tx_key = ntohl(cmd->memory.key);
+        ctx->tx_key = ntohu64(cmd->memory.key);
         ctx->tx.offset = 0;
         rdmaAdjustSendbuf(ctx, ctx->tx.length);
         break;
