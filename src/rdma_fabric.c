@@ -184,6 +184,7 @@ typedef struct RdmaGlobal {
     struct fid_cq *cq;
     pthread_t cq_thread;            /* dedicated CQ polling thread */
     volatile int cq_thread_running; /* flag to stop the thread */
+    pthread_mutex_t fabric_mutex;   /* serializes EP/CQ/AV access between threads (recursive) */
 
     /* Global recv buffer pool */
     ValkeyRdmaCmd *recv_pool;
@@ -226,14 +227,16 @@ static void rdmaGlobalCqHandler(struct aeEventLoop *el, int fd, void *clientData
 static int rdmaProcessPendingData(void);
 
 /* CQ polling thread — replaces timer-based polling for lower latency.
- * Tight loop: poll CQ, dispatch completions, signal per-connection eventfds.
- * When CQ is empty, usleep(10) to yield CPU (~100K polls/sec). */
+ * Holds fabric_mutex per CQ drain iteration to serialize with main thread.
+ * When CQ is empty, releases lock and yields CPU (~10μs). */
 static void *rdmaCqPollingThread(void *arg) {
     UNUSED(arg);
     while (rdma_g.cq_thread_running) {
+        pthread_mutex_lock(&rdma_g.fabric_mutex);
         rdmaGlobalCqHandler(NULL, -1, NULL, 0);
-        /* Brief yield when no completions — avoids burning a full core.
-         * 10μs gives ~100K polls/sec, much better than 1ms timer. */
+        pthread_mutex_unlock(&rdma_g.fabric_mutex);
+        /* Brief yield when no completions — avoids burning a full core
+         * and gives main thread a window to acquire the mutex. */
         usleep(10);
     }
     return NULL;
@@ -299,6 +302,13 @@ static inline void rdmaUnregisterConnection(fi_addr_t addr) {
     }
 }
 
+/* Thread-safe AV remove wrapper */
+static inline void rdmaAvRemove(fi_addr_t *addr) {
+    pthread_mutex_lock(&rdma_g.fabric_mutex);
+    fi_av_remove(rdma_g.av, addr, 1, 0);
+    pthread_mutex_unlock(&rdma_g.fabric_mutex);
+}
+
 /* ========================================================================
  * Memory management (page-aligned for RDMA MR, same as rdma.c)
  * ======================================================================== */
@@ -353,6 +363,15 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
     int ret;
 
     if (rdma_g.initialized) return C_OK;
+
+    /* Init recursive mutex for thread-safe EP/CQ/AV access */
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&rdma_g.fabric_mutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
 
     hints = fi_allocinfo();
     if (!hints) return C_ERR;
@@ -526,6 +545,7 @@ static void rdmaGlobalCleanup(void) {
     if (rdma_g.fabric) fi_close(&rdma_g.fabric->fid);
     if (rdma_g.fi) fi_freeinfo(rdma_g.fi);
 
+    pthread_mutex_destroy(&rdma_g.fabric_mutex);
     memset(&rdma_g, 0, sizeof(rdma_g));
 }
 
@@ -542,7 +562,9 @@ static int rdmaPostRecv(ValkeyRdmaCmd *cmd) {
         .addr = FI_ADDR_UNSPEC,
         .context = opctx,
     };
+    pthread_mutex_lock(&rdma_g.fabric_mutex);
     int ret = fi_recvmsg(rdma_g.ep, &msg, 0);
+    pthread_mutex_unlock(&rdma_g.fabric_mutex);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_recvmsg failed: %s", fi_strerror(-ret));
         return C_ERR;
@@ -595,8 +617,10 @@ static int rdmaSetupConnBufs(RdmaContext *ctx) {
         goto err;
     }
     if (rdma_g.fi->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+        pthread_mutex_lock(&rdma_g.fabric_mutex);
         fi_mr_bind(ctx->send_mr, &rdma_g.ep->fid, 0);
         fi_mr_enable(ctx->send_mr);
+        pthread_mutex_unlock(&rdma_g.fabric_mutex);
     }
     ctx->send_mr_desc = fi_mr_desc(ctx->send_mr);
 
@@ -616,8 +640,10 @@ static int rdmaSetupConnBufs(RdmaContext *ctx) {
         goto err;
     }
     if (rdma_g.fi->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+        pthread_mutex_lock(&rdma_g.fabric_mutex);
         fi_mr_bind(ctx->rx.mr, &rdma_g.ep->fid, 0);
         fi_mr_enable(ctx->rx.mr);
+        pthread_mutex_unlock(&rdma_g.fabric_mutex);
     }
     ctx->rx.mr_desc = fi_mr_desc(ctx->rx.mr);
 
@@ -652,8 +678,10 @@ static int rdmaAdjustSendbuf(RdmaContext *ctx, unsigned int length) {
         return C_ERR;
     }
     if (rdma_g.fi->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+        pthread_mutex_lock(&rdma_g.fabric_mutex);
         fi_mr_bind(ctx->tx.mr, &rdma_g.ep->fid, 0);
         fi_mr_enable(ctx->tx.mr);
+        pthread_mutex_unlock(&rdma_g.fabric_mutex);
     }
     ctx->tx.mr_desc = fi_mr_desc(ctx->tx.mr);
 
@@ -702,7 +730,9 @@ static fi_addr_t rdmaTcpHandshakeServer(int tcp_fd) {
     if (tcpReadFull(tcp_fd, peer_name, peer_name_len) < 0) return FI_ADDR_UNSPEC;
 
     /* Insert peer into AV */
+    pthread_mutex_lock(&rdma_g.fabric_mutex);
     ret = fi_av_insert(rdma_g.av, peer_name, 1, &addr, 0, NULL);
+    pthread_mutex_unlock(&rdma_g.fabric_mutex);
     if (ret != 1) {
         serverLog(LL_WARNING, "RDMA: fi_av_insert failed: %s", fi_strerror(-ret));
         return FI_ADDR_UNSPEC;
@@ -716,7 +746,7 @@ static fi_addr_t rdmaTcpHandshakeServer(int tcp_fd) {
     return addr;
 
 err_remove:
-    fi_av_remove(rdma_g.av, &addr, 1, 0);
+    rdmaAvRemove(&addr);
     return FI_ADDR_UNSPEC;
 }
 
@@ -741,7 +771,9 @@ static fi_addr_t rdmaTcpHandshakeClient(int tcp_fd) {
     if (tcpReadFull(tcp_fd, peer_name, peer_name_len) < 0) return FI_ADDR_UNSPEC;
 
     /* Insert into AV */
+    pthread_mutex_lock(&rdma_g.fabric_mutex);
     ret = fi_av_insert(rdma_g.av, peer_name, 1, &addr, 0, NULL);
+    pthread_mutex_unlock(&rdma_g.fabric_mutex);
     if (ret != 1) {
         serverLog(LL_WARNING, "RDMA: fi_av_insert (client) failed: %s", fi_strerror(-ret));
         return FI_ADDR_UNSPEC;
@@ -781,7 +813,9 @@ static int rdmaSendCommand(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
         .context = opctx,
     };
 
+    pthread_mutex_lock(&rdma_g.fabric_mutex);
     ret = fi_sendmsg(rdma_g.ep, &msg, FI_COMPLETION);
+    pthread_mutex_unlock(&rdma_g.fabric_mutex);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_sendmsg failed: %s", fi_strerror(-ret));
         _cmd->keepalive.opcode = VALKEY_RDMA_INVALID_OPCODE;
@@ -1103,7 +1137,7 @@ rdmaAccept(aeEventLoop *el, connListener *listener, char *err, int fd, char *ip,
     evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (evfd < 0) {
         serverRdmaError(err, "RDMA: eventfd creation failed");
-        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        rdmaAvRemove(&peer_addr);
         return ANET_ERR;
     }
 
@@ -1117,7 +1151,7 @@ rdmaAccept(aeEventLoop *el, connListener *listener, char *err, int fd, char *ip,
     if (rdmaSetupConnBufs(ctx) == C_ERR) {
         serverRdmaError(err, "RDMA: setup connection buffers failed");
         close(evfd);
-        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        rdmaAvRemove(&peer_addr);
         zfree(ctx->ip);
         zfree(ctx);
         return ANET_ERR;
@@ -1281,7 +1315,7 @@ static int connRdmaConnect(connection *conn,
     /* Create eventfd */
     evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (evfd < 0) {
-        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        rdmaAvRemove(&peer_addr);
         return C_ERR;
     }
 
@@ -1294,7 +1328,7 @@ static int connRdmaConnect(connection *conn,
 
     if (rdmaSetupConnBufs(ctx) == C_ERR) {
         close(evfd);
-        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        rdmaAvRemove(&peer_addr);
         zfree(ctx->ip);
         zfree(ctx);
         return C_ERR;
@@ -1323,7 +1357,7 @@ static int connRdmaConnect(connection *conn,
         rdmaDelKeepalive(server.el, ctx);
         rdmaUnregisterConnection(peer_addr);
         rdmaDestroyConnBufs(ctx);
-        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        rdmaAvRemove(&peer_addr);
         close(evfd);
         zfree(ctx->ip);
         zfree(ctx);
@@ -1377,7 +1411,7 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
 
     evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (evfd < 0) {
-        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        rdmaAvRemove(&peer_addr);
         return C_ERR;
     }
 
@@ -1389,7 +1423,7 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
 
     if (rdmaSetupConnBufs(ctx) == C_ERR) {
         close(evfd);
-        fi_av_remove(rdma_g.av, &peer_addr, 1, 0);
+        rdmaAvRemove(&peer_addr);
         zfree(ctx->ip);
         zfree(ctx);
         return C_ERR;
@@ -1453,7 +1487,7 @@ static void connRdmaClose(connection *conn) {
         /* Unregister from connection map */
         if (rdma_conn->peer_addr != FI_ADDR_UNSPEC) {
             rdmaUnregisterConnection(rdma_conn->peer_addr);
-            fi_av_remove(rdma_g.av, &rdma_conn->peer_addr, 1, 0);
+            rdmaAvRemove(&rdma_conn->peer_addr);
         }
 
         rdmaDestroyConnBufs(ctx);
@@ -1512,7 +1546,9 @@ static size_t connRdmaSend(connection *conn, const void *data, size_t data_len) 
         flags |= FI_COMPLETION;
     }
 
+    pthread_mutex_lock(&rdma_g.fabric_mutex);
     ret = fi_writemsg(rdma_g.ep, &msg, flags);
+    pthread_mutex_unlock(&rdma_g.fabric_mutex);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: fi_writemsg failed: %s", fi_strerror(-ret));
         conn->state = CONN_STATE_ERROR;
