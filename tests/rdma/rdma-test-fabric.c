@@ -88,6 +88,12 @@ typedef enum valkeyRdmaOpcode {
 #define RDMA_MAX_EP_NAME 256
 #define RDMA_RECV_POOL_SIZE 256
 
+/* FI_CONTEXT2 wrapper (EFA requires 64-byte context) */
+typedef struct RdmaOpCtx {
+    struct fi_context2 fi_ctx;  /* 64 bytes, provider-reserved */
+    void *user_data;            /* back-pointer to valkeyRdmaCmd* */
+} RdmaOpCtx;
+
 #define rdmaFatal(msg)                                          \
     do {                                                        \
         fprintf(stderr, "%s:%d %s\n", __func__, __LINE__, msg); \
@@ -135,6 +141,8 @@ typedef struct FabricContext {
 
     /* CMD: send/recv command buffers */
     valkeyRdmaCmd *cmd_buf;     /* [0..POOL-1] recv, [POOL..POOL+WQE-1] send */
+    RdmaOpCtx *cmd_ctx;         /* FI_CONTEXT2 wrappers, same indexing as cmd_buf */
+    RdmaOpCtx rma_ctx;          /* reusable context for RDMA writes */
     struct fid_mr *cmd_mr;
     void *cmd_mr_desc;
 } FabricContext;
@@ -228,13 +236,17 @@ static void rdmaDestroyIoBuf(FabricContext *ctx) {
 
     if (ctx->cmd_mr) { fi_close(&ctx->cmd_mr->fid); ctx->cmd_mr = NULL; }
     free(ctx->cmd_buf); ctx->cmd_buf = NULL;
+    free(ctx->cmd_ctx); ctx->cmd_ctx = NULL;
 }
 
 static int rdmaPostRecv(FabricContext *ctx, valkeyRdmaCmd *cmd) {
+    int idx = (int)(cmd - ctx->cmd_buf);
+    RdmaOpCtx *opctx = &ctx->cmd_ctx[idx];
+    opctx->user_data = cmd;
     struct iovec iov = {.iov_base = cmd, .iov_len = sizeof(valkeyRdmaCmd)};
     struct fi_msg msg = {
         .msg_iov = &iov, .desc = &ctx->cmd_mr_desc,
-        .iov_count = 1, .addr = FI_ADDR_UNSPEC, .context = cmd,
+        .iov_count = 1, .addr = FI_ADDR_UNSPEC, .context = opctx,
     };
     int ret = fi_recvmsg(ctx->ep, &msg, 0);
     if (ret) {
@@ -253,6 +265,8 @@ static int rdmaSetupIoBuf(FabricContext *ctx) {
     size_t cmd_bytes = sizeof(valkeyRdmaCmd) * cmd_count;
     ctx->cmd_buf = calloc(cmd_bytes, 1);
     if (!ctx->cmd_buf) return -1;
+    ctx->cmd_ctx = calloc(cmd_count, sizeof(RdmaOpCtx));
+    if (!ctx->cmd_ctx) { free(ctx->cmd_buf); ctx->cmd_buf = NULL; return -1; }
 
     access = FI_SEND | FI_RECV;
     ret = fi_mr_reg(ctx->domain, ctx->cmd_buf, cmd_bytes, access, 0, 0, 0, &ctx->cmd_mr, NULL);
@@ -349,10 +363,12 @@ static int rdmaSendCommand(FabricContext *ctx, valkeyRdmaCmd *cmd) {
 
     memcpy(_cmd, cmd, sizeof(valkeyRdmaCmd));
 
+    RdmaOpCtx *opctx = &ctx->cmd_ctx[i];
+    opctx->user_data = _cmd;
     struct iovec iov = {.iov_base = _cmd, .iov_len = sizeof(valkeyRdmaCmd)};
     struct fi_msg msg = {
         .msg_iov = &iov, .desc = &ctx->cmd_mr_desc,
-        .iov_count = 1, .addr = ctx->peer_addr, .context = _cmd,
+        .iov_count = 1, .addr = ctx->peer_addr, .context = opctx,
     };
 
     ret = fi_sendmsg(ctx->ep, &msg, FI_COMPLETION);
@@ -449,7 +465,8 @@ static int connRdmaHandleCq(FabricContext *ctx) {
                     return -1;
             }
         } else if (cqe.flags & FI_SEND) {
-            connRdmaHandleSend((valkeyRdmaCmd *)cqe.op_context);
+            RdmaOpCtx *opctx = (RdmaOpCtx *)cqe.op_context;
+            connRdmaHandleSend((valkeyRdmaCmd *)opctx->user_data);
         } else if (cqe.flags & FI_RMA) {
             /* RDMA write completion, nothing to do */
         }
@@ -525,7 +542,7 @@ static size_t connRdmaSend(FabricContext *ctx, const void *data, size_t data_len
         .msg_iov = &iov, .desc = &ctx->send_mr_desc,
         .iov_count = 1, .addr = ctx->peer_addr,
         .rma_iov = &rma_iov, .rma_iov_count = 1,
-        .context = NULL,
+        .context = &ctx->rma_ctx,
         .data = (uint64_t)htonl((uint32_t)data_len),
     };
 
@@ -585,7 +602,7 @@ pollcq:
  * ======================================================================== */
 
 static void valkeyRdmaClose(FabricContext *ctx) {
-    connRdmaHandleCq(ctx);
+    if (ctx->cq) connRdmaHandleCq(ctx);
 
     if (ctx->peer_addr != FI_ADDR_UNSPEC)
         fi_av_remove(ctx->av, &ctx->peer_addr, 1, 0);
@@ -625,7 +642,8 @@ static FabricContext *valkeyContextConnectFabric(const char *addr, int port, int
     if (!hints) goto err;
     hints->caps = FI_MSG | FI_RMA | FI_RMA_EVENT | FI_SOURCE;
     hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+    hints->mode = FI_CONTEXT2 | FI_RX_CQ_DATA;
+    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
     hints->tx_attr->msg_order = FI_ORDER_SAS;
     hints->rx_attr->msg_order = FI_ORDER_SAS;
 

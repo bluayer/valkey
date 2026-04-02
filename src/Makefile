@@ -364,12 +364,14 @@ ifeq ($(RDMA_PROVIDER),fabric)
 	RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists libfabric && echo $$?)
 	ifeq ($(RDMA_PKGCONFIG),0)
 		RDMA_LIBS=$(shell $(PKG_CONFIG) --libs libfabric)
+		RDMA_INCLUDES=$(shell $(PKG_CONFIG) --cflags libfabric)
 	else
 		RDMA_LIBS=-lfabric
+		RDMA_INCLUDES=
 	endif
 	RDMA_SRC=rdma_fabric.c
 	RDMA_OBJ=rdma_fabric.o
-	RDMA_PROVIDER_CFLAGS=-DUSE_RDMA_FABRIC
+	RDMA_PROVIDER_CFLAGS=-DUSE_RDMA_FABRIC $(RDMA_INCLUDES)
 else
 	RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists librdmacm libibverbs && echo $$?)
 	ifeq ($(RDMA_PKGCONFIG),0)

@@ -157,7 +157,7 @@ sds getListensInfoString(sds info) {
         if (listener->ct == NULL) continue;
 
         info = sdscatfmt(info, "listener%i:name=%s", j, getConnectionTypeName(listener->ct->get_type()));
-        for (int i = 0; i < listener->count; i++) {
+        for (int i = 0; i < listener->bindaddr_count; i++) {
             info = sdscatfmt(info, ",bind=%s", listener->bindaddr[i]);
         }
 

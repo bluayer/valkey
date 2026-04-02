@@ -28,6 +28,7 @@
 #include "connhelpers.h"
 
 #include <arpa/inet.h>
+#include <stddef.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
@@ -41,6 +42,11 @@
 #include <sys/eventfd.h>
 #include <netdb.h>
 #include <sys/mman.h>
+
+#ifndef container_of
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+#endif
 
 /* ========================================================================
  * Wire protocol types — MUST match ibverbs rdma.c exactly (32 bytes each)
@@ -71,6 +77,13 @@ typedef union ValkeyRdmaCmd {
     ValkeyRdmaKeepalive keepalive;
     ValkeyRdmaMemory memory;
 } ValkeyRdmaCmd;
+
+/* Operation context wrapper for FI_CONTEXT2 (EFA requires 64-byte context).
+ * fi_ctx MUST be the first member — provider writes into it directly. */
+typedef struct RdmaOpCtx {
+    struct fi_context2 fi_ctx;  /* 64 bytes, provider-reserved */
+    void *user_data;            /* ValkeyRdmaCmd* for recv/send, or NULL */
+} RdmaOpCtx;
 
 typedef enum ValkeyRdmaOpcode {
     GetServerFeature = 0,
@@ -135,8 +148,12 @@ typedef struct RdmaContext {
 
     /* Per-connection send command buffers (VALKEY_RDMA_MAX_WQE entries) */
     ValkeyRdmaCmd *send_buf;
+    RdmaOpCtx *send_ctx;        /* FI_CONTEXT2 wrappers for send ops */
     struct fid_mr *send_mr;
     void *send_mr_desc;
+
+    /* Per-connection RMA write context (reusable) */
+    RdmaOpCtx rma_ctx;
 } RdmaContext;
 
 typedef struct rdma_connection {
@@ -161,6 +178,7 @@ typedef struct RdmaGlobal {
 
     /* Global recv buffer pool */
     ValkeyRdmaCmd *recv_pool;
+    RdmaOpCtx *recv_ctx;        /* FI_CONTEXT2 wrappers for recv ops */
     struct fid_mr *recv_pool_mr;
     void *recv_pool_mr_desc;
     int recv_pool_posted;
@@ -298,6 +316,9 @@ static void rdmaMemoryFree(void *ptr, size_t size) {
     }
 }
 
+/* Forward declaration for error cleanup */
+static void rdmaGlobalCleanup(void);
+
 /* ========================================================================
  * Global fabric resource initialization (FI_EP_RDM)
  * ======================================================================== */
@@ -315,7 +336,8 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
 
     hints->caps = FI_MSG | FI_RMA | FI_RMA_EVENT | FI_SOURCE;
     hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+    hints->mode = FI_CONTEXT2 | FI_RX_CQ_DATA;
+    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
     hints->tx_attr->msg_order = FI_ORDER_SAS;
     hints->rx_attr->msg_order = FI_ORDER_SAS;
 
@@ -415,9 +437,10 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
         goto err;
     }
 
-    /* Allocate global recv buffer pool */
+    /* Allocate global recv buffer pool + FI_CONTEXT2 wrappers */
     size_t pool_bytes = sizeof(ValkeyRdmaCmd) * RDMA_RECV_POOL_SIZE;
     rdma_g.recv_pool = rdmaMemoryAlloc(pool_bytes);
+    rdma_g.recv_ctx = zcalloc(sizeof(RdmaOpCtx) * RDMA_RECV_POOL_SIZE);
 
     uint64_t mr_access = FI_RECV | FI_SEND | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
     ret = fi_mr_reg(rdma_g.domain, rdma_g.recv_pool, pool_bytes, mr_access, 0, 0, 0,
@@ -434,16 +457,18 @@ static int rdmaGlobalInit(const char *node, const char *service, uint64_t flags)
 
     rdma_g.recv_pool_mr_desc = fi_mr_desc(rdma_g.recv_pool_mr);
 
-    /* Post initial recv buffers */
+    /* Post initial recv buffers (context = RdmaOpCtx for FI_CONTEXT2) */
     for (int i = 0; i < RDMA_RECV_POOL_SIZE; i++) {
         ValkeyRdmaCmd *cmd = &rdma_g.recv_pool[i];
+        RdmaOpCtx *opctx = &rdma_g.recv_ctx[i];
+        opctx->user_data = cmd;
         struct iovec iov = {.iov_base = cmd, .iov_len = sizeof(ValkeyRdmaCmd)};
         struct fi_msg msg = {
             .msg_iov = &iov,
             .desc = &rdma_g.recv_pool_mr_desc,
             .iov_count = 1,
             .addr = FI_ADDR_UNSPEC,
-            .context = cmd,
+            .context = opctx,
         };
         ret = fi_recvmsg(rdma_g.ep, &msg, 0);
         if (ret) {
@@ -478,6 +503,7 @@ static void rdmaGlobalCleanup(void) {
 
     if (rdma_g.recv_pool_mr) fi_close(&rdma_g.recv_pool_mr->fid);
     if (rdma_g.recv_pool) rdmaMemoryFree(rdma_g.recv_pool, sizeof(ValkeyRdmaCmd) * RDMA_RECV_POOL_SIZE);
+    zfree(rdma_g.recv_ctx);
 
     if (rdma_g.ep) fi_close(&rdma_g.ep->fid);
     if (rdma_g.av) fi_close(&rdma_g.av->fid);
@@ -491,13 +517,16 @@ static void rdmaGlobalCleanup(void) {
 
 /* Re-post a recv buffer to the shared EP */
 static int rdmaPostRecv(ValkeyRdmaCmd *cmd) {
+    int idx = (int)(cmd - rdma_g.recv_pool);
+    RdmaOpCtx *opctx = &rdma_g.recv_ctx[idx];
+    opctx->user_data = cmd;
     struct iovec iov = {.iov_base = cmd, .iov_len = sizeof(ValkeyRdmaCmd)};
     struct fi_msg msg = {
         .msg_iov = &iov,
         .desc = &rdma_g.recv_pool_mr_desc,
         .iov_count = 1,
         .addr = FI_ADDR_UNSPEC,
-        .context = cmd,
+        .context = opctx,
     };
     int ret = fi_recvmsg(rdma_g.ep, &msg, 0);
     if (ret) {
@@ -532,6 +561,8 @@ static void rdmaDestroyConnBufs(RdmaContext *ctx) {
     }
     rdmaMemoryFree(ctx->send_buf, sizeof(ValkeyRdmaCmd) * VALKEY_RDMA_MAX_WQE);
     ctx->send_buf = NULL;
+    zfree(ctx->send_ctx);
+    ctx->send_ctx = NULL;
 }
 
 static int rdmaSetupConnBufs(RdmaContext *ctx) {
@@ -539,9 +570,10 @@ static int rdmaSetupConnBufs(RdmaContext *ctx) {
     size_t length;
     int ret, i;
 
-    /* Send command buffers (per-connection) */
+    /* Send command buffers (per-connection) + FI_CONTEXT2 wrappers */
     length = sizeof(ValkeyRdmaCmd) * VALKEY_RDMA_MAX_WQE;
     ctx->send_buf = rdmaMemoryAlloc(length);
+    ctx->send_ctx = zcalloc(sizeof(RdmaOpCtx) * VALKEY_RDMA_MAX_WQE);
     access = FI_SEND | FI_RECV;
     ret = fi_mr_reg(rdma_g.domain, ctx->send_buf, length, access, 0, 0, 0, &ctx->send_mr, NULL);
     if (ret) {
@@ -556,6 +588,7 @@ static int rdmaSetupConnBufs(RdmaContext *ctx) {
 
     for (i = 0; i < VALKEY_RDMA_MAX_WQE; i++) {
         ctx->send_buf[i].keepalive.opcode = VALKEY_RDMA_INVALID_OPCODE;
+        ctx->send_ctx[i].user_data = &ctx->send_buf[i];
     }
 
     /* RX data buffer (remote writes here via RDMA) */
@@ -723,13 +756,15 @@ static int rdmaSendCommand(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
 
     memcpy(_cmd, cmd, sizeof(ValkeyRdmaCmd));
 
+    RdmaOpCtx *opctx = &ctx->send_ctx[i];
+    opctx->user_data = _cmd;
     struct iovec iov = {.iov_base = _cmd, .iov_len = sizeof(ValkeyRdmaCmd)};
     struct fi_msg msg = {
         .msg_iov = &iov,
         .desc = &ctx->send_mr_desc,
         .iov_count = 1,
         .addr = ctx->peer_addr,
-        .context = _cmd,
+        .context = opctx,
     };
 
     ret = fi_sendmsg(rdma_g.ep, &msg, FI_COMPLETION);
@@ -844,11 +879,8 @@ static void rdmaGlobalCqHandler(struct aeEventLoop *el, int fd, void *clientData
                       fi_strerror(err_entry.err),
                       fi_cq_strerror(rdma_g.cq, err_entry.prov_errno, err_entry.err_data, NULL, 0));
 
-            /* Try to find the connection via op_context if available */
-            if (err_entry.op_context) {
-                /* op_context is a ValkeyRdmaCmd* from send, or recv pool entry */
-                /* Cannot reliably map to connection, just log the error */
-            }
+            /* op_context is RdmaOpCtx* — cannot reliably map to a
+             * specific connection, just log the error above. */
             continue;
         }
         if (ret < 0) {
@@ -882,8 +914,9 @@ static void rdmaGlobalCqHandler(struct aeEventLoop *el, int fd, void *clientData
             rdmaSignalConnection(rdma_conn);
 
         } else if (cqe.flags & FI_SEND) {
-            /* Send completion — context is the cmd buffer */
-            ValkeyRdmaCmd *cmd = (ValkeyRdmaCmd *)cqe.op_context;
+            /* Send completion — context is RdmaOpCtx wrapping the cmd */
+            RdmaOpCtx *opctx = (RdmaOpCtx *)cqe.op_context;
+            ValkeyRdmaCmd *cmd = (ValkeyRdmaCmd *)opctx->user_data;
             connRdmaHandleSend(cmd);
 
         } else if (cqe.flags & FI_RMA) {
@@ -1456,7 +1489,7 @@ static size_t connRdmaSend(connection *conn, const void *data, size_t data_len) 
         .addr = ctx->peer_addr,
         .rma_iov = &rma_iov,
         .rma_iov_count = 1,
-        .context = NULL,
+        .context = &ctx->rma_ctx,
         .data = (uint64_t)htonl((uint32_t)data_len),
     };
 
