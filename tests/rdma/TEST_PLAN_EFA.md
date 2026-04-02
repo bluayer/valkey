@@ -120,13 +120,14 @@ cp src/valkey-server valkey-server-verbs
 ### 3B. Basic Connectivity (on Server node)
 
 ```bash
-SERVER_IP=<private IP of server instance>
+SERVER_IP=<private IP of EFA ENI>
 
 # Test 1: libfabric backend
 ./valkey-server-fabric \
   --loadmodule ./valkey-rdma-fabric.so \
   --port 0 --rdma-port 6379 \
-  --bind $SERVER_IP --protected-mode no
+  --bind $SERVER_IP --rdma-bind $SERVER_IP \
+  --protected-mode no
 
 # From client node:
 ./src/valkey-cli -u rdma://$SERVER_IP:6379 PING
@@ -159,7 +160,8 @@ connect to a fabric-backend server directly.
 ```bash
 # Server: libfabric backend, but also enable TCP port for CLI access
 ./valkey-server-fabric --loadmodule ./valkey-rdma-fabric.so \
-  --port 6380 --rdma-port 6379 --bind $SERVER_IP --protected-mode no
+  --port 6380 --rdma-port 6379 \
+  --bind $SERVER_IP --rdma-bind $SERVER_IP --protected-mode no
 
 # Client: connect via TCP for admin/testing
 ./src/valkey-cli -h $SERVER_IP -p 6380 PING
@@ -228,13 +230,15 @@ done
 ```bash
 # 1. Run server with ibverbs backend, benchmark, save results
 ./valkey-server-verbs --loadmodule ./valkey-rdma-verbs.so \
-  --port 0 --rdma-port 6379 --bind $SERVER_IP --protected-mode no &
+  --port 0 --rdma-port 6379 \
+  --bind $SERVER_IP --rdma-bind $SERVER_IP --protected-mode no &
 bash perf_test.sh $SERVER_IP verbs > results_verbs.csv
 kill %1
 
 # 2. Run server with libfabric backend, benchmark, save results
 ./valkey-server-fabric --loadmodule ./valkey-rdma-fabric.so \
-  --port 0 --rdma-port 6379 --bind $SERVER_IP --protected-mode no &
+  --port 0 --rdma-port 6379 \
+  --bind $SERVER_IP --rdma-bind $SERVER_IP --protected-mode no &
 bash perf_test.sh $SERVER_IP fabric > results_fabric.csv
 kill %1
 
@@ -283,6 +287,31 @@ aws ec2 delete-placement-group --group-name valkey-efa-test
 # Delete security group
 aws ec2 delete-security-group --group-id $SG_ID
 ```
+
+---
+
+## 8. Server Configuration Best Practices
+
+**Always specify `--rdma-bind`** with the EFA ENI's private IP address:
+
+```bash
+./valkey-server --loadmodule ./valkey-rdma.so \
+  --port 6380 \
+  --rdma-port 6379 \
+  --bind $EFA_PRIVATE_IP \
+  --rdma-bind $EFA_PRIVATE_IP \
+  --protected-mode no
+```
+
+Why:
+- Without `--rdma-bind`, Valkey binds to `*` (all interfaces). On EFA instances
+  this may bind to interfaces that cannot serve RDMA traffic.
+- Explicit `--rdma-bind` ensures the RDMA listener uses the correct EFA interface.
+- This matches the existing Valkey best practice of always specifying `--bind`
+  for TCP, and avoids edge cases where `bindaddr[]` is empty but listening fds
+  exist.
+- For multi-ENI setups (separate TCP and EFA interfaces), `--bind` and
+  `--rdma-bind` can point to different IPs.
 
 ---
 
